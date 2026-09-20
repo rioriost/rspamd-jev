@@ -1,0 +1,15 @@
+.DS_Store
+.env
+.env.*
+!.env.example
+*api-key*
+*.eml
+*.mbox
+*.log
+*.jsonl
+*.csv
+__pycache__/
+*.pyc
+.venv/
+data/
+results/
