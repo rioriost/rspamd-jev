@@ -15,7 +15,7 @@ local settings = {
   allow_external = false,
   api_key_file = '',
   recipient_domains = {},
-  require_gpt = true,
+  require_gpt = false,
   sample_rate = 0.05,
   timeout = 1.5,
   requests_per_second = 1,
@@ -97,6 +97,9 @@ elseif settings.mode == 'live' then
   end
   if not settings.allow_external or next(domains) == nil then
     error('jev: live mode requires allow_external and explicit recipient_domains')
+  end
+  if settings.api_key_file:sub(1, 1) ~= '/' then
+    error('jev: live mode requires api_key_file (absolute path readable by Rspamd)')
   end
   local file = io.open(settings.api_key_file, 'r')
   if not file then error('jev: cannot read api_key_file') end
@@ -268,7 +271,6 @@ end
 
 local inflight, next_request, blocked_until = 0, 0, 0
 local function check(task)
-  local observed = baseline(task)
   local record = {
     schema_version = 1,
     timestamp = util.get_time(),
@@ -277,9 +279,9 @@ local function check(task)
     model = settings.model,
     prompt_version = 'email-choice-v1',
     sample_rate = settings.sample_rate,
+    require_gpt = settings.require_gpt,
     probability_threshold = settings.probability_threshold,
     confidence_threshold = settings.confidence_threshold,
-    baseline = observed,
     status = 'pending',
   }
   task:cache_set('jev_eval', record)
@@ -294,7 +296,9 @@ local function check(task)
       if not domains[(recipient.domain or ''):lower()] then skip('recipient_domain'); return end
     end
   end
-  if settings.require_gpt and observed.verdict == 'not_observed' then skip('no_gpt_result'); return end
+  if settings.require_gpt and baseline(task).verdict == 'not_observed' then
+    skip('no_gpt_result'); return
+  end
   if task:get_size() > settings.max_message_bytes then skip('message_too_large'); return end
   local sample = tonumber(record.message_digest:sub(1, 8), 16)
   if not sample then
@@ -388,6 +392,7 @@ rspamd_config:register_symbol({
     end
     local metric = task:get_metric_result() or {}
     record.rspamd_score, record.rspamd_action = metric.score, metric.action
+    record.baseline = baseline(task)
     logger.infox(task, 'JEV_EVAL %s', ucl.to_format(record, 'json-compact'))
   end,
 })

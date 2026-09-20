@@ -1,5 +1,5 @@
 -- Rspamd/UCL boundary doubles; run real daemon smoke tests before deployment.
-local registered, records, requests, options, logs, clock
+local registered, records, requests, options, logs, clock, gpt_config
 local reply, parse_ok, schedule_ok, request_hook
 local tokens = {}
 local serial = 0
@@ -60,11 +60,13 @@ end
 local function setup(overrides)
   registered, records, requests, logs, clock = {}, {}, {}, {}, 100
   reply, parse_ok, schedule_ok, request_hook = valid_reply(), true, true, nil
-  options = {enabled = true, require_gpt = true, sample_rate = 1}
+  options = {enabled = true, sample_rate = 1}
+  gpt_config = {type = 'ollama', model = 'baseline-model'}
   for key, value in pairs(overrides or {}) do options[key] = value end
   rspamd_config = {
     get_all_opt = function(_, name)
-      return name == 'jev' and options or {type = 'ollama', model = 'baseline-model'}
+      if name == 'jev' then return options end
+      if name == 'gpt' then return gpt_config end
     end,
     register_symbol = function(_, symbol)
       registered[symbol.name] = symbol
@@ -134,7 +136,7 @@ test('disabled loads without credentials or registrations', function()
   assert(next(registered) == nil)
 end)
 test('safe settings and explicit dependency', function()
-  setup()
+  setup({require_gpt = true})
   assert(registered.JEV_CHECK.dependency == 'GPT_CHECK')
   assert(registered.JEV_LOG.type == 'idempotent')
   assert(registered.JEV_LOG.dependency == nil)
@@ -148,6 +150,8 @@ test('configuration rejects unsafe modes and invalid limits', function()
     {mode = 'other'}, {mode = 'live'}, {url = 'http://evil.test/v1/systemone'},
     {mode = 'live', allow_external = true, recipient_domains = {'example.test'},
       url = 'https://evil.test/v1/systemone'},
+    {mode = 'live', allow_external = true, recipient_domains = {'example.test'},
+      url = 'https://api.typesafe.ai/v1/systemone', api_key_file = 'relative-key'},
     {model = 'jev-latest'}, {sample_rate = 1.1}, {sample_rate = 0/0},
     {timeout = -1}, {max_inflight = 0}, {max_urls = 1.5},
     {unknown = true}, {require_gpt = 'true'}, {recipient_domains = {'*'}},
@@ -162,6 +166,7 @@ test('live activation validates and reads secret without logging it', function()
     return {read = function() return 'test-secret\n' end, close = function() end}
   end
   local ok, err = pcall(setup, {mode = 'live', allow_external = true,
+    api_key_file = '/test-only/jev-api-key',
     url = 'https://api.typesafe.ai/v1/systemone', recipient_domains = {'example.test'}})
   io.open = old_open
   assert(ok, err)
@@ -219,7 +224,7 @@ test('privacy and selection skips issue no HTTP', function()
       change = function(t) t.recipients[2] = {domain = 'other.test'} end},
     {reason = 'no_smtp_recipients', opts = {recipient_domains = {'example.test'}},
       change = function(t) t.recipients = {} end},
-    {reason = 'no_gpt_result', change = function(t) t.symbols = {} end},
+    {reason = 'no_gpt_result', opts = {require_gpt = true}, change = function(t) t.symbols = {} end},
     {reason = 'message_too_large', change = function(t) t.size = 1048577 end},
     {reason = 'sample', opts = {sample_rate = 0}},
     {reason = 'no_text_evidence', change = function(t) t.text = ''; t.headers.Subject = '' end},
@@ -319,14 +324,37 @@ test('rate limiting is independent of inflight limit', function()
   run(task())
   assert(run(task()).reason == 'rate_limit')
 end)
-test('standalone mock avoids dependency; missing GPT stays unknown', function()
-  setup({require_gpt = false})
+test('default standalone operation needs no GPT module or verdict', function()
+  setup()
+  gpt_config = nil
   assert(registered.JEV_CHECK.dependency == nil)
   local t = task()
   t.symbols = {}
   local r = run(t)
   finish()
+  log(t)
   assert(r.status == 'ok' and r.baseline.verdict == 'not_observed')
+  assert(r.require_gpt == false and r.baseline.provider == nil)
+end)
+test('optional baseline is collected after all postfilters finish', function()
+  setup()
+  gpt_config = {type = 'openai', model = 'another-provider-model'}
+  local t = task()
+  t.symbols = {}
+  local r = run(t)
+  finish()
+  t.symbols.GPT_SPAM = {{options = {'0.95'}}}
+  log(t)
+  assert(r.baseline.verdict == 'spam' and r.baseline.probability == 0.95)
+  assert(r.baseline.provider == 'openai' and r.require_gpt == false)
+end)
+test('comparison selection preserves explicit require_gpt behavior', function()
+  setup({require_gpt = true})
+  local t = task()
+  local r = run(t)
+  finish()
+  log(t)
+  assert(r.status == 'ok' and r.require_gpt == true and r.baseline.verdict == 'ham')
 end)
 test('final logger reports incomplete requests explicitly', function()
   setup()

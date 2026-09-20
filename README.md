@@ -1,75 +1,72 @@
 # rspamd-jev
 
-Rspamd + Ollamaを維持したまま、TypeSafe Jevを追加評価する**シャドーモード専用**Luaプラグインです。Jevのアカウント/APIキーを取得する前に、ローカルモックで疎通・異常系・比較ログを確認できます。
+[日本語の導入ガイド](docs/README.ja.md)
 
-**初期状態は無効・外部送信なし。受信拒否、スコア加減算、Bayes自動学習は実装していません。**
+A host-independent **shadow-evaluation plugin for Rspamd** using TypeSafe Jev. It works with plain Rspamd; Ollama, OpenAI, and Rspamd's `gpt` module are **optional comparison baselines**, not dependencies.
 
-評価予定先: `192.168.1.4`。このリポジトリの作成時点ではSSH認証が通らず、サーバーのバージョン・設定は未確認、インストールも未実施です。既存Ollama連携が標準の`gpt`モジュール（`GPT_CHECK` / `GPT_SPAM` / `GPT_HAM`）であることを設置前に確認してください。
+**Experimental: disabled by default, no external requests by default, no filtering decisions.** Jev observations have zero score and do not change delivery actions or set Bayes learning flags. This is an evaluation tool, not a production-ready replacement for existing spam filters. Live model quality and service availability still need evaluation with your own authorized data.
 
-## 構成と評価範囲
+## Requirements
+
+| Use | Requirements |
+|---|---|
+| Plugin | A working Rspamd installation with its bundled Lua runtime/modules, administrative access to its local configuration, and readable logs |
+| Compatibility | Native CI covers Ubuntu 24.04's Rspamd 3.8.1. This is the oldest tested version, not a recommendation to run an outdated release. Validate your supported distribution/version before deployment |
+| Live Jev | TypeSafe account/API access, an API key, an available pinned model version, DNS and outbound HTTPS to `api.typesafe.ai:443`, trusted CA certificates |
+| Data approval | Permission to send the selected mail content externally; an explicit allowlist of SMTP recipient domains; review of retention, processing location, and contractual requirements |
+| Local mock and reports | Python 3.10+; standard library only |
+| Developer tests | Python 3.10+, `make`, and LuaJIT or Lua; native smoke tests additionally need Linux/Unix, `rspamd`, and `rspamadm` |
+| Optional GPT comparison | A working Rspamd `gpt` module exposing `GPT_CHECK` and `GPT_SPAM` / `GPT_HAM` / `GPT_UNCERTAIN`; support depends on the installed Rspamd version/provider |
+
+Python and a separate Lua interpreter are **not required to run the plugin itself**. No GPU, NPU, MLX, OpenVINO, Redis, or local inference runtime is required. Jev inference runs at TypeSafe, not on the mail server. If API access is waitlisted, complete the mock setup first.
+
+This project does not install Rspamd, configure an MTA, or set up Ollama. Ensure your existing filtering pipeline works before adding it.
+
+## How it works
 
 ```text
-通常のRspamd -> 既存GPT_CHECK/Ollama -> JEV_CHECK -> 最終JEV_LOG
-                    |                    |
-                  既存判定             スコア0の観測だけ
+Existing Rspamd checks (+ optional GPT provider)
+  -> JEV_CHECK: select eligible messages, sample, query Jev asynchronously
+  -> JEV_LOG: record Jev, the final Rspamd action/score, and any GPT verdict
 ```
 
-- `rspamd/jev.lua`: 非同期HTTP、入力抽出、応答検証、確率/信頼度による観測ラベル、比較ログ。
-- `rspamd/jev.conf`: 無効状態の設定例。
-- `tools/mock_jev.py`: Python標準ライブラリだけで動くループバック限定モック。
-- `tools/summarize.py`: Rspamdログ/JSONLから比較・遅延・費用・正解ラベル付き指標を集計。
-- `tests/`: Lua境界テスト、Python HTTP/集計テスト、実Rspamdの隔離スモークテスト。
+- Default `require_gpt = false`: no GPT dependency or GPT-based selection. Evaluate eligible mail even without a GPT result. If GPT runs, its verdict is collected at the final logging stage.
+- Optional `require_gpt = true`: wait for `GPT_CHECK`, then only evaluate messages with an observed GPT verdict. This preserves the original paired-comparison workflow.
+- Neither GPT verdicts nor the overall Rspamd score are sent to Jev. Authentication-check symbols are included as evidence.
+- `JEV_HAM`, `JEV_SPAM`, `JEV_PHISHING`, `JEV_UNCERTAIN`, and `JEV_ERROR` have registration scores and insertion weights of zero. Do not add them to action rules, composites, or learning conditions.
 
-`require_gpt = true`では`GPT_CHECK`の終了を依存関係で待ち、既存GPT判定が観測されたメールだけをサンプリングします。JevへGPT判定・既存総合スコアは送信しません。比較対象は同じメールですが、プロンプト・入力抽出はOllamaと同一とは限りません。
+Asynchronous HTTP avoids blocking a worker's event loop, but the **individual mail scan still waits for Jev**. Budget for the extra latency.
 
-`JEV_HAM`、`JEV_SPAM`、`JEV_PHISHING`、`JEV_UNCERTAIN`、`JEV_ERROR`は登録スコア・挿入重みともに0です。これらを既存のcomposite/force_actions/学習条件へ追加しないでください。Jevの処理時間は追加されるため、「スコアが不変」と「遅延も不変」は異なります。
+## Installation
 
-## APIキーなしで確認
-
-必要環境: Python 3.10以降、LuaJITまたはLua。Python追加パッケージは不要です。
+### 1. Obtain the source and inspect your deployment
 
 ```sh
-make test
-# LuaJITがなければ:
-make test LUA=lua
-
-python3 tools/mock_jev.py --outcome phishing
-# 別ターミナル:
-curl --fail http://127.0.0.1:18080/health
-```
-
-モックは本文を判定せず、起動時の`--outcome`を返します。`ham` / `spam` / `phishing` / `uncertain` / `429` / `500` / `529` / `malformed`が選べます。`--delay 3`でタイムアウトを再現できます。実APIキーをモックへ渡さないでください。
-
-ネイティブのRspamdがあるLinuxでは、既存サービスの設定を触らず、一時ディレクトリ・別ポート・合成メールで確認できます。
-
-```sh
-python3 tests/smoke_rspamd.py
-```
-
-GitHub Actionsもこのスモークテストを実行します。ここではOllamaの出力シンボルを合成するため、実Ollamaとの連携・実Jevの精度を確認するものではありません。LuaテストではHTTP/UCL/Rspamd APIをダブルに置き換え、ネイティブテストで実JSON・MIME・スケジューラを補完します。
-
-## 192.168.1.4への追加
-
-以下は**サーバー上で管理者が実行する手順**です。SSHユーザー・インストール経路・サービス実行ユーザーを確認し、既存設定をバックアップしてください。コンテナ運用ならコンテナ内のパス/ネットワークに読み替えます。
-
-```sh
+git clone https://github.com/rioriost/rspamd-jev.git
+cd rspamd-jev
 rspamd --version
 sudo rspamadm configtest
-# ローカル画面で確認。APIキー等が含まれる場合があるので出力を公開しない:
-sudo rspamadm configdump gpt
+sudo rspamadm configdump modules
 ```
 
-`gpt.type = "ollama"`、モデル、`GPT_CHECK`と判定シンボル、`autolearn`の設定を確認します。比較のために既存`gpt.conf`やスコアを変更する必要はありません。既存Ollamaによる自動学習が有効なら、評価中の基準が変化する点を記録してください。
+Back up your local Rspamd configuration outside the repository. Check the actual configuration directory, service user/group, reload mechanism, worker count, and MTA/Rspamd timeout budgets. Examples below use `/etc/rspamd`; installations using `/usr/local/etc/rspamd` or other paths must substitute their own directory.
 
-このリポジトリをサーバーへ配置した後:
+The recommended loading mechanism is `modules.try_path` pointing to the local `plugins.d` directory. Do not replace the existing module paths. See **Custom loaders and containers** below if your installation differs.
+
+### 2. Install the files, initially disabled
+
+Run on the Rspamd host, from the checkout. These commands are for a **first installation**; if either file already exists, stop and use the update procedure.
 
 ```sh
-sudo install -d -m 0755 /etc/rspamd/plugins.d
-sudo install -m 0644 rspamd/jev.lua /etc/rspamd/plugins.d/jev.lua
-sudo install -m 0644 rspamd/jev.conf /etc/rspamd/local.d/jev.conf
+CONFDIR=/etc/rspamd
+sudo test ! -e "$CONFDIR/plugins.d/jev.lua" &&
+sudo test ! -e "$CONFDIR/local.d/jev.conf" &&
+sudo install -d -m 0755 "$CONFDIR/plugins.d" "$CONFDIR/local.d" &&
+sudo install -m 0644 rspamd/jev.lua "$CONFDIR/plugins.d/jev.lua" &&
+sudo install -m 0644 rspamd/jev.conf "$CONFDIR/local.d/jev.conf"
 ```
 
-同名ファイルが既にある場合は上書きせず内容を確認します。既存の`/etc/rspamd/rspamd.conf.local`へ次のブロックを**追記**します。ファイル全体を置き換えないでください。
+Append this block **once** to your existing `rspamd.conf.local`. Do not replace that file, edit package-managed defaults, or include the new plugin twice:
 
 ```ucl
 jev {
@@ -77,48 +74,74 @@ jev {
 }
 ```
 
-標準設定の`modules.try_path`が`$LOCAL_CONFDIR/plugins.d/`を読み込むことを確認してください。独自構成で読み込まれない場合は、既存の`rspamd.local.lua`から次の1行を追加する方法もあります。**両方の方法を併用しない**でください。
+`$LOCAL_CONFDIR` above is a Rspamd configuration variable, not a shell variable. The supplied `jev.conf` contains the **inside** of this block; do not wrap it in another `jev {}` block.
 
-```lua
-dofile('/etc/rspamd/plugins.d/jev.lua')
+The sample configuration has `enabled = false`. Validate before reloading:
+
+```sh
+sudo rspamadm configtest
+# Only after a successful check; adapt to your service manager:
+sudo systemctl reload rspamd
 ```
 
-### モックでサーバー側を確認
+If reload is unsupported, schedule a restart. A valid configuration alone does not prove the plugin was loaded; confirm its symbols/logs in the next step.
 
-モックはRspamdと同じホスト/ネットワーク名前空間で起動します。Mac上のモックを`192.168.1.4`の`127.0.0.1`から参照することはできません。
+### 3. Exercise the mock without an API key
+
+Start the mock in the **same network namespace as Rspamd**, in a separate terminal:
 
 ```sh
 python3 tools/mock_jev.py --outcome phishing
+curl --fail http://127.0.0.1:18080/health
 ```
 
-`local.d/jev.conf`を次の設定に変更します。
+Edit the existing values in `local.d/jev.conf` (do not append duplicate keys):
 
 ```ucl
 enabled = true;
 mode = "mock";
 url = "http://127.0.0.1:18080/v1/systemone";
 allow_external = false;
+require_gpt = false;
 sample_rate = 1.0;
-require_gpt = true;
 ```
 
-キーの追記ではなく既存の値を編集し、重複させないでください。`require_gpt = true`ではOllamaが評価をスキップしたメールにはJevも問い合わせません。モック単体の確認に限り`false`にできますが、その場合のGPT比較は順序が保証されません。実評価では`true`に戻します。
+After `configtest` and reload, scan a **synthetic** message through your local scanner. The command below assumes the normal worker listens on `127.0.0.1:11333`; adapt it to your deployment, not the MTA's milter port.
 
 ```sh
-sudo rspamadm configtest
-# configtest成功時のみ。環境がreloadを提供しない場合は計画的なrestart:
-sudo systemctl reload rspamd
+printf 'From: sender@example.test\nTo: recipient@example.test\nSubject: Synthetic Jev test\nMIME-Version: 1.0\nContent-Type: text/plain; charset=utf-8\n\nThis is synthetic mail for plugin verification.\n' |
+  rspamc -h 127.0.0.1:11333
 ```
 
-個人情報を含まない合成メールを`rspamc`で検査し、従来のスコア/アクションと`JEV_*`のスコア0、ログの`JEV_EVAL`を確認します。モックの固定判定を実際の検出性能と解釈しないでください。
+Expect `JEV_PHISHING` with score 0 and a `JEV_EVAL` log record containing `"mode":"mock"`. Compare the delivery action/score with the plugin disabled. If existing settings skip this scan, use a dedicated test instance (`make smoke`) instead of weakening production policies. Your MTA/worker must supply SMTP recipients for **live** evaluation; the simple mock scan above does not exercise that gate.
 
-確認後は`enabled = false`に戻して再読込すれば、アカウント発行までHTTPリクエストは一切行われません。
+The mock returns the selected outcome regardless of content. It also supports `ham`, `spam`, `uncertain`, `429`, `500`, `529`, and `malformed`; `--delay 3` exercises timeouts. It listens only on loopback and rejects real API keys. Its outputs are **not accuracy measurements**.
 
-### APIキー発行後
+Set `enabled = false` and reload when finished, then stop the mock with Ctrl-C. While waiting for API access, leave the plugin disabled.
 
-本番APIへの送信を許可できる**評価用受信ドメイン**を選びます。送信内容・米国での処理・保持期間/ZDR・契約条件を確認してください。学習に使われないことは、保存されないことと同じではありません。
+### 4. Activate live evaluation
 
-APIキーはGitやコマンドラインに書かず、サーバー上で`sudoedit`等を使って`/etc/rspamd/jev-api-key`へ1行で保存します。所有者root、Rspamd実行グループに読み取りだけを許可（例: `0640 root:_rspamd`、実環境のグループに読み替え）してください。
+Approve the data flow first. Jev receives potentially sensitive message content; there is **no automatic anonymization**. Customer-data training exclusion is not the same as zero retention. Check [TypeSafe's data policies](https://docs.typesafe.ai/legal), model access, and account quotas.
+
+Store the API key in a file outside the repository. Use your actual Rspamd user/group; `_rspamd` is only an example:
+
+```sh
+CONFDIR=/etc/rspamd
+RSPAMD_USER=_rspamd
+RSPAMD_GROUP=_rspamd
+KEY_FILE="$CONFDIR/jev-api-key"
+# Creates a protected empty file only if it does not already exist:
+sudo test ! -e "$KEY_FILE" &&
+sudo install -o root -g "$RSPAMD_GROUP" -m 0640 /dev/null "$KEY_FILE"
+sudoedit "$KEY_FILE"
+sudo chown root:"$RSPAMD_GROUP" "$KEY_FILE"
+sudo chmod 0640 "$KEY_FILE"
+sudo -u "$RSPAMD_USER" test -r "$KEY_FILE"
+```
+
+Enter just the key on one line, without `Bearer`, quotes, or variable assignments. Do not put keys in command arguments, shell history, Git, or issue reports. Rootless containers should use equivalent ownership for their runtime UID and a read-only secret mount.
+
+Edit `local.d/jev.conf`:
 
 ```ucl
 enabled = true;
@@ -128,72 +151,125 @@ model = "jev-1.13.0";
 allow_external = true;
 api_key_file = "/etc/rspamd/jev-api-key";
 recipient_domains = ["evaluation.example.com"];
-require_gpt = true;
+require_gpt = false;
 sample_rate = 0.05;
 ```
 
-`evaluation.example.com`は例です。自分が管理し、外部送信を承認したドメインへ変更します。全SMTP受信者のドメインが完全一致する場合だけ送信します。サブドメインの暗黙許可・ワイルドカードはありません。受信者不明・認証済み送信メールはスキップします。
+Replace the key path and recipient domain with values approved for **your** installation. All SMTP recipients must match the allowlist exactly. Unknown recipients, unapproved co-recipients, and authenticated submissions are skipped. No implicit subdomain matching or wildcards are supported.
 
-`configtest`成功後に再読込します。キーは設定ロード時に読み込むため、ローテーション時にも再読込が必要です。`jev-latest`等の可変エイリアスは拒否し、モデルを固定します。指定バージョンがアカウントで利用できるかも確認してください。
+Verify that the pinned model is available to your account. `jev-latest` and other moving aliases are rejected. The live endpoint is restricted to the official HTTPS URL and TLS verification stays enabled.
 
-## ログと比較
+Run `configtest`, check key-file readability, reload, and inspect initial `JEV_EVAL` records and error logs. Keys are read at configuration load; rotation also requires a reload.
 
-既存のRspamdログへ`JEV_EVAL { ... }`を1スキャンにつき1行記録します（Rspamd自体がチェックを省略したタスクを除く）。
+## Optional comparison with Ollama or another GPT provider
 
-記録するもの: メッセージdigest、時刻、mock/live、モデル/質問版、閾値、サンプリング率、GPT判定/確率/設定モデル、最終Rspamdスコア/アクション、Jev確率/信頼度/観測ラベル、API時間/使用量、スキップ/エラー理由。
+First configure and validate Rspamd's [`gpt` module](https://docs.rspamd.com/modules/gpt/) separately. The plugin works with either provider's standard GPT symbols; there is no Ollama host or model hardcoded here.
 
-**プラグインの評価レコードには本文・件名・アドレス・URL・APIキー・APIの生エラー応答を記録しません。** Rspamd既存ログのプレフィックス/別のログ行はその限りではありません。digestを含む評価ログもメールと照合可能な情報としてアクセスを制限してください。
+```sh
+# Inspect locally: configuration dumps can contain credentials; do not publish them.
+sudo rspamadm configdump gpt
+```
+
+Set `require_gpt = true` only if you want **GPT-selected paired evaluation**. Jev will depend on `GPT_CHECK` and skip messages without a GPT verdict (`no_gpt_result`). Merely setting this option does not install or enable GPT. Older Rspamd versions without that module can still use standalone Jev.
+
+Keep `require_gpt = false` if you want independent Jev sampling; GPT observations, when present, are still collected after all postfilters finish. A missing GPT result is `not_observed`, never an assumed ham verdict. Existing GPT settings, models, scores, and autolearning are not changed.
+
+These are comparisons on the same messages, not necessarily identical prompts/input extraction. GPT's own selection rules and any existing autolearning affect the experiment.
+
+## Configuration reference
+
+All options live inside the `jev` configuration section. See [`rspamd/jev.conf`](rspamd/jev.conf).
+
+| Option | Default | Meaning |
+|---|---|---|
+| `enabled` | `false` | Enable the plugin |
+| `mode` | `"mock"` | `mock` or `live`; changing mode also requires the matching URL |
+| `url` | loopback port 18080 | Mock permits only `http://127.0.0.1:PORT/v1/systemone`; live requires the official URL |
+| `model` | `"jev-1.13.0"` | Pinned three-component model version |
+| `allow_external` | `false` | Explicit live-data approval gate |
+| `api_key_file` | `""` | Absolute readable key-file path; required in live mode |
+| `recipient_domains` | `[]` | Exact SMTP domain allowlist; nonempty in live mode; enforced in mock too if supplied |
+| `require_gpt` | `false` | Require a prior GPT verdict; otherwise GPT is optional |
+| `sample_rate` | `0.05` | Deterministic digest-based sampling, 0..1 |
+| `timeout` | `1.5` | HTTP timeout in seconds; no retries |
+| `requests_per_second` | `1` | Per-worker request start rate |
+| `max_inflight` | `2` | Per-worker outstanding-request limit |
+| `cooldown` | `60` | Per-worker pause in seconds after an error |
+| `max_message_bytes` | `1048576` | Skip larger messages |
+| `max_body_bytes` | `6000` | Combined UTF-8 body byte budget, not characters |
+| `max_request_bytes` | `24576` | Skip requests whose serialized JSON exceeds this limit |
+| `max_urls` / `max_attachments` | `16` / `8` | Evidence item limits |
+| `probability_threshold` / `confidence_threshold` | `0.9` / `0.9` | Both must be met to emit a category rather than `uncertain`; never change scores |
+
+Limits and cooldowns are **per worker**, not shared across hosts/processes. Budget `worker count × requests_per_second` plus other account usage against your quota, with headroom. There is no queue, retry, Redis rate limiter, or response cache. Repeated scans can make additional paid requests.
+
+## Logs and reports
+
+`JEV_LOG` writes `JEV_EVAL { ... }` to your existing Rspamd log. It records the message digest, mode/model/prompt, selection settings, probabilities, latency, token use, errors/skips, optional GPT baseline, and final Rspamd score/action. Tasks skipped by Rspamd itself may produce no Jev record.
+
+The plugin's JSON record excludes bodies, subjects, addresses, URLs, keys, and raw upstream error bodies. Existing Rspamd log prefixes/other lines can still contain mail metadata. Protect logs and labels; digests can be linked to mail.
 
 ```sh
 python3 tools/summarize.py /path/to/rspamd.log --mode mock
 python3 tools/summarize.py /path/to/rspamd.log --mode live
-# journaldの場合:
 journalctl -u rspamd -o cat | python3 tools/summarize.py - --mode live
-```
-
-JSON出力の主な項目:
-
-| 項目 | 意味 |
-|---|---|
-| `statuses` / `skip_error_reasons` | 成功・失敗・評価対象外の数と理由 |
-| `agreement` / `baseline_vs_jev` | GPTシンボルとJevの二値判定一致。正解率ではない |
-| `http_latency_ms` | Jev HTTP要求のp50/p95/p99。Ollama時間や総スキャン時間ではない |
-| `estimated_success_cost_usd` | 成功応答の入力トークンからの概算。失敗分等を含む請求額ではない |
-| `current_pipeline_actions` | 現行Rspamd+Ollamaの最終アクション |
-| `paired_labeled_*` | 同じ判定可能・正解ラベル付き集合でのJev対GPTシンボル比較 |
-| `pipeline_paired_labeled_*` | 同じ集合でのJev対現行Rspamd+Ollama最終アクション比較 |
-
-正解ラベルはOllamaから作らず、人手確認したCSVを指定します。ヘッダは`message_digest,label`、ラベルは`ham` / `spam` / `phishing`です。CSV/メール/評価ログは`.gitignore`で除外しています。
-
-```sh
 python3 tools/summarize.py /path/to/rspamd.log --labels /private/path/labels.csv
 ```
 
-二値評価ではspamとphishingを迷惑メール側へまとめます。Jevの`uncertain`、GPTの未観測/競合/不確実は対応するペア精度計算から除外し、coverageを別に出します。最終アクションは`no action`を正常、`reject`/`add header`/`rewrite subject`/`quarantine`/`discard`を迷惑メール側として扱い、`greylist`/`soft reject`などは保留です。サイト独自の隔離運用等がこの解釈に合うか確認してください。
+Labels must be independently human-verified, not copied from another classifier. CSV header: `message_digest,label`; labels: `ham`, `spam`, `phishing`. Actual mail, CSVs, keys, and evaluation logs must stay outside Git.
 
-同じdigestの再スキャンは品質指標では最新の成功結果だけを使い、API費用/遅延には全スキャンを含めます。モデル・質問版・閾値・サンプリング率・GPTモデルの混在はエラーになるため、期間/設定別にログを分割してください。正常メールの誤検知率と見逃し改善、保留率を重視し、未知の精度を0や100%で補いません。
+| Report | Interpretation |
+|---|---|
+| `statuses`, `skip_error_reasons` | Success, failure, and exclusion counts |
+| `agreement`, `baseline_vs_jev` | Jev vs optional GPT predictions; agreement is **not** accuracy |
+| `http_latency_ms` | Jev HTTP p50/p95/p99, not GPT or total mail-scan time |
+| `estimated_success_cost_usd` | Successful-response input-token estimate, not a verified bill; adjust `--price-per-million` |
+| `paired_labeled_*` | Jev vs GPT on the same labeled, comparable subset |
+| `pipeline_paired_labeled_rspamd`, `pipeline_paired_labeled_jev` | Existing Rspamd pipeline vs Jev, including deployments without GPT |
+| `current_pipeline_actions` | Existing pipeline's final actions |
 
-## 安全制約・現在の限界
+Binary metrics combine spam and phishing. Uncertain/unobserved/conflicting predictions are excluded from the corresponding paired metrics, with coverage reported separately. Pipeline actions map `no action` to ham and `reject` / `add header` / `rewrite subject` / `quarantine` / `discard` to spam; deferrals such as `greylist` and `soft reject` are unresolved. Check that this interpretation matches your site's policy.
 
-- 外部送信する情報: 件名、From/Reply-To、最大4つの非添付テキストパート（HTMLはタグ除去）、URL/表示文字/ホスト、添付名/MIME型、固定リストの認証検証シンボル。宛先一覧、添付内容、SMTP認証情報は送りません。
-- URLのクエリや本文には個人情報/トークンが残り得ます。**自動匿名化はしていません。** 機密メールの外部送信を許可しないでください。メール中のリンクへはアクセスしません。
-- 最大本文6,000 **UTF-8バイト**、本文を含む送信JSON最大24,576バイト。バイト境界で文字を壊さず切り詰め、切り詰めを記録します。トークン上限の厳密な計算ではありません。
-- 画像/OCR・添付解析は対象外。本文の切り詰め、複数MIME表現、欠けた購読履歴による誤判定は別途評価が必要です。
-- タイムアウト1.5秒、再試行なし、失敗時は既存判定を維持し、60秒の休止。401/429/529、不正JSON/不正確率、モデル不一致、HTTPの予約失敗も明示的に記録します。
-- レート上限1要求/秒、同時2要求、休止状態は**ワーカーごと**です。全体共有のRedis制限ではありません。ワーカー数×1要求/秒＋同アカウントの他用途がAPI制限を超えないよう設定してください。大規模運用・バースト制御は未対応です。
-- キャッシュは意図的に未実装。評価時のキャッシュ混入・誤ったキーによる判定再利用を避ける代わりに、再スキャンもAPI使用量が発生します。
-- GPTがスキップした正常/スパムや、Rspamdが早期終了したメールは既定の比較対象外です。これだけで全受信メールの性能を主張できません。
-- Jevの信頼度は誤検知率の保証ではありません。プロンプトインジェクションへの指示だけで安全を保証せず、人手の正解データと悪意ある本文で検証してください。
-- 日本語の性能、実アカウントの遅延/制限、対象サーバーでの互換性は実地確認が必要です。現時点で自動拒否へ移行する機能は提供していません。
+Quality metrics use the latest successful result per digest; latency/cost include all requests with relevant observations. Mixed models, prompts, thresholds, sampling/selection policies, or GPT configurations are rejected: split logs by experiment. No labels means no claim of measured accuracy. Prioritize ham false positives, missed-spam reduction, and abstention coverage, not aggregate accuracy alone.
 
-## 停止・削除
+### Migration from the initial comparison-only defaults
 
-まず`local.d/jev.conf`の`enabled = false`にして`configtest`後に再読込します。削除時は追加した`jev`ブロック/任意の`dofile`だけを除去してから、専用プラグイン・設定・キーを個別に削除します。既存`gpt`設定や`rspamd.conf.local`全体は削除しません。
+- The default `require_gpt` changed from `true` to `false`. Existing configurations explicitly setting `true` keep the old behavior. Set it explicitly before updating if you relied on the implicit old default; the new default can broaden the set sent to Jev.
+- Do not overwrite your `jev.conf` with the new sample. The sample no longer assumes a key-file location.
+- Records now include `require_gpt`. Older schema-1 logs remain readable on their own, but must not be mixed with newly recorded selection policies.
+- Use `pipeline_paired_labeled_rspamd` in new consumers. `pipeline_paired_labeled_rspamd_ollama` remains an identical deprecated alias for existing report consumers; it does not imply Ollama was used.
 
-## 参考
+## Custom loaders and containers
 
-- [TypeSafe API](https://docs.typesafe.ai/api)
-- [モデル・レート制限・言語対応](https://docs.typesafe.ai/models)
-- [既知の弱点](https://docs.typesafe.ai/model-jaggedness/jev-1.13)
-- [Rspamd GPTプラグイン](https://docs.rspamd.com/modules/gpt/)
-- [Rspamd Lua HTTP](https://docs.rspamd.com/lua/rspamd_http/)
+Paths are examples, not host identities. For custom layouts, use the directory represented by your deployment's `$LOCAL_CONFDIR`. If your installation does not load `plugins.d` via `modules.try_path`, use its documented custom Lua loader: place `jev.lua` outside auto-loaded directories and add a single `dofile('/absolute/path/to/jev.lua')` to the existing `rspamd.local.lua`. The `jev` configuration block is still required. Do not use both loaders.
+
+For containers, persist or bind-mount the plugin and local configuration rather than editing an ephemeral container. Mount secrets read-only, verify the runtime UID can read them, and validate/reload **inside** the container. In mock mode, loopback refers to that container's network namespace. Run the mock in the same namespace (or use the isolated smoke test); a separate host or ordinary sidecar has different loopback. Do not expose the mock on a public interface or disable live TLS checks.
+
+## Updating, disabling, and removing
+
+1. Back up your installed plugin and local configuration. Review the diff and migration notes; use a reviewed commit from the repository.
+2. Update **only** the plugin file, merging any desired configuration changes manually. Never overwrite a live configuration or key with sample files.
+3. Run `configtest`, reload, and verify a synthetic scan plus log output. If validation fails, restore the backed-up plugin/configuration before reloading. No schema/data migration is needed.
+
+To disable, set `enabled = false`, validate, and reload. To remove, first disable, then remove only the added `jev` include/optional `dofile` and the dedicated plugin/config/key files. Do not remove the entire local configuration file or change other classifiers.
+
+## Limits and testing
+
+The evidence contains subject, From/Reply-To, up to four non-attachment text parts (HTML tags removed), URLs/visible text/hosts, attachment names/types, and selected authentication symbols. It excludes attachment contents and recipient lists. URLs are not fetched. Body/URL fields can contain secrets or personal data; no automatic redaction is performed. UTF-8 truncation is recorded but is not an exact token-budget calculation.
+
+There is no image/OCR analysis, shared cache/rate limiter, automatic enforcement, or learning from Jev. Confidence is not a false-positive-rate guarantee, and instructions to ignore malicious content are not a prompt-injection defense guarantee. Empty/partial evidence, language differences, unavailable subscription history, and dataset selection all require local evaluation.
+
+```sh
+make test                 # LuaJIT + Python tests
+make test LUA=lua         # Alternative standalone Lua
+make smoke               # Linux: isolated real Rspamd, no existing service changes
+```
+
+Native tests install into a temporary custom configuration directory using the shipped sample and `modules.try_path`. They cover disabled defaults, standalone operation, explicit GPT selection, late optional GPT observations, and HTTP error/timeout handling with synthetic mail. GPT results are simulated; neither a real GPT service nor a TypeSafe account is used. CI coverage does not establish live-model accuracy or compatibility with every deployment.
+
+## Licensing and references
+
+No distribution license has been selected yet. A public repository is not itself a license grant. A license must be chosen before recommending third-party reuse or redistribution.
+
+- [TypeSafe API](https://docs.typesafe.ai/api), [models and limits](https://docs.typesafe.ai/models), [known model limitations](https://docs.typesafe.ai/model-jaggedness/jev-1.13)
+- [Rspamd GPT module](https://docs.rspamd.com/modules/gpt/), [Lua HTTP API](https://docs.rspamd.com/lua/rspamd_http/)

@@ -121,7 +121,8 @@ class ReportTests(unittest.TestCase):
                 list(summarize.read_records(io.StringIO(line)))
 
     def test_invalid_shapes_and_nonfinite_values(self):
-        for field, value in (("latency_ms", float("nan")), ("message_digest", "bad"), ("baseline", {})):
+        for field, value in (("latency_ms", float("nan")), ("message_digest", "bad"),
+                             ("baseline", {}), ("require_gpt", "false")):
             item = record()
             item[field] = value
             with self.subTest(field=field), self.assertRaises(ValueError):
@@ -187,11 +188,32 @@ class ReportTests(unittest.TestCase):
         item["rspamd_action"] = "reject"
         result = summarize.summarize([item], labels={"a" * 32: "spam"})
         self.assertEqual(result["paired_labeled_baseline"]["fn"], 1)
-        self.assertEqual(result["pipeline_paired_labeled_rspamd_ollama"]["tp"], 1)
+        self.assertEqual(result["pipeline_paired_labeled_rspamd"]["tp"], 1)
+        self.assertEqual(result["pipeline_paired_labeled_rspamd_ollama"],
+                         result["pipeline_paired_labeled_rspamd"])
         item["rspamd_action"] = "soft reject"
         result = summarize.summarize([item], labels={"a" * 32: "spam"})
         self.assertEqual(result["pipeline_paired_labeled_coverage"], 0)
         self.assertEqual(result["pipeline_paired_labeled_jev"]["n"], 0)
+
+    def test_standalone_reports_pipeline_metrics_without_a_gpt_baseline(self):
+        item = record(decision="phishing", baseline="not_observed")
+        item.update(require_gpt=False, rspamd_action="no action")
+        item["baseline"] = {"verdict": "not_observed"}
+        result = summarize.summarize([item], labels={"a" * 32: "phishing"})
+        self.assertIsNone(result["agreement"])
+        self.assertEqual(result["paired_labeled_baseline"]["n"], 0)
+        self.assertEqual(result["pipeline_paired_labeled_rspamd"]["fn"], 1)
+        self.assertEqual(result["pipeline_paired_labeled_jev"]["tp"], 1)
+
+    def test_selection_modes_and_legacy_records_cannot_be_silently_mixed(self):
+        standalone, comparison, legacy = record(), record("b"), record("c")
+        standalone["require_gpt"] = False
+        comparison["require_gpt"] = True
+        for other in (comparison, legacy):
+            with self.assertRaisesRegex(ValueError, "selection"):
+                summarize.summarize([standalone, other])
+        self.assertEqual(summarize.summarize([legacy])["scans"], 1)
 
     def test_cost_and_percentiles(self):
         items = [record(format(index, "x")) for index in range(10)]

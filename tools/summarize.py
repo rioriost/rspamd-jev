@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Summarize JEV_EVAL logs without treating Ollama predictions as ground truth."""
+"""Summarize Jev observations against Rspamd and optional GPT module predictions."""
 
 import argparse
 import csv
@@ -36,6 +36,8 @@ def read_records(stream):
                 raise ValueError("invalid mode")
             if record.get("status") not in {"ok", "error", "skipped"}:
                 raise ValueError("invalid status")
+            if "require_gpt" in record and not isinstance(record["require_gpt"], bool):
+                raise ValueError("invalid require_gpt")
             if not number(record.get("timestamp")):
                 raise ValueError("invalid timestamp")
             baseline = record.get("baseline")
@@ -121,14 +123,15 @@ def summarize(records, mode="live", labels=None, price_per_million=0.042):
     configs = {
         json.dumps({
             key: record.get(key) for key in (
-                "model", "prompt_version", "sample_rate", "probability_threshold", "confidence_threshold"
+                "model", "prompt_version", "sample_rate", "probability_threshold",
+                "confidence_threshold", "require_gpt"
             )
         } | {"baseline": {key: record["baseline"].get(key) for key in ("provider", "configured_model")}},
                    sort_keys=True)
         for record in selected
     }
     if len(configs) > 1:
-        raise ValueError("mixed model/prompt/threshold/sampling/baseline settings; split the input logs")
+        raise ValueError("mixed model/prompt/threshold/sampling/selection/baseline settings; split the input logs")
     statuses = Counter(record["status"] for record in selected)
     reasons = Counter(record.get("reason", "unspecified") for record in selected if record["status"] != "ok")
     successes = [record for record in selected if record["status"] == "ok"]
@@ -152,6 +155,9 @@ def summarize(records, mode="live", labels=None, price_per_million=0.042):
     pipeline_paired = [record for record in labeled_unique
                        if record["jev"]["decision"] != "uncertain"
                        and pipeline_decision(record) != "uncertain"]
+    pipeline_metrics = metrics([
+        (labels[record["message_digest"]], pipeline_decision(record)) for record in pipeline_paired
+    ])
     return {
         "mode": mode,
         "warning": "Mock results are synthetic, not model quality." if mode == "mock"
@@ -186,9 +192,8 @@ def summarize(records, mode="live", labels=None, price_per_million=0.042):
         "pipeline_paired_labeled_jev": metrics([
             (labels[record["message_digest"]], record["jev"]["decision"]) for record in pipeline_paired
         ]),
-        "pipeline_paired_labeled_rspamd_ollama": metrics([
-            (labels[record["message_digest"]], pipeline_decision(record)) for record in pipeline_paired
-        ]),
+        "pipeline_paired_labeled_rspamd": pipeline_metrics,
+        "pipeline_paired_labeled_rspamd_ollama": pipeline_metrics,
     }
 
 
