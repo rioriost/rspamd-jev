@@ -30,13 +30,18 @@ package.preload.lua_util = function()
   return {disable_module = function() end}
 end
 package.preload.ucl = function()
+  local function parser()
+    return {
+      parse_string = function() return parse_ok end,
+      get_object = function() return reply end,
+    }
+  end
   return {
     to_format = encode,
-    untrusted_parser = function()
-      return {
-        parse_string = function() return parse_ok end,
-        get_object = function() return reply end,
-      }
+    untrusted_parser = parser,
+    parser = function(flags)
+      assert(flags == 100, 'legacy parser must disable macros and file variables')
+      return parser()
     end,
   }
 end
@@ -132,7 +137,7 @@ test('safe settings and explicit dependency', function()
   setup()
   assert(registered.JEV_CHECK.dependency == 'GPT_CHECK')
   assert(registered.JEV_LOG.type == 'idempotent')
-  assert(registered.JEV_LOG.dependency == 'JEV_CHECK')
+  assert(registered.JEV_LOG.dependency == nil)
   for _, name in ipairs({'SPAM', 'HAM', 'PHISHING', 'UNCERTAIN', 'ERROR'}) do
     assert(registered['JEV_' .. name].score == 0)
     assert(registered['JEV_' .. name].flags == 'nostat')
@@ -236,7 +241,7 @@ test('UTF-8 truncation and attachment metadata do not expose attachment contents
   t.text = '\227\129\130\227\129\132' -- two UTF-8 codepoints
   local function url()
     return {
-      to_http = function() return 'https://example.test/link' end,
+      get_text = function() return 'https://example.test/link' end,
       get_host = function() return 'example.test' end,
       get_visible = function() return 'View invoice' end,
     }
@@ -329,6 +334,16 @@ test('final logger reports incomplete requests explicitly', function()
   run(t)
   log(t)
   assert(records[1].status == 'error' and records[1].reason == 'incomplete')
+end)
+test('legacy UCL uses explicit safe flags', function()
+  local ucl = require 'ucl'
+  local original = ucl.untrusted_parser
+  ucl.untrusted_parser = nil
+  setup()
+  local r = run(task())
+  finish()
+  ucl.untrusted_parser = original
+  assert(r.status == 'ok')
 end)
 
 for _, entry in ipairs(tests) do

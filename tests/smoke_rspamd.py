@@ -61,6 +61,7 @@ rspamd_config:register_symbol({
 options {{
   pidfile = "{work / 'rspamd.pid'}";
   tempdir = "{work}";
+  hs_cache_dir = "{work}";
 }}
 logging {{
   type = "console";

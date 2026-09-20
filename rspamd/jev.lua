@@ -133,6 +133,14 @@ local AUTH_SYMBOLS = {
   'DMARC_POLICY_ALLOW', 'DMARC_POLICY_REJECT', 'DMARC_POLICY_QUARANTINE',
   'DMARC_POLICY_SOFTFAIL', 'DMARC_NA', 'DMARC_DNSFAIL',
 }
+local make_parser = ucl.untrusted_parser
+if not make_parser then
+  logger.infox(rspamd_config, 'jev: using legacy UCL parser with macros and file variables disabled')
+  make_parser = function()
+    -- UCL_PARSER_NO_TIME | UCL_PARSER_DISABLE_MACRO | UCL_PARSER_NO_FILEVARS.
+    return ucl.parser(4 + 32 + 64)
+  end
+end
 
 local function clip(value, limit)
   local text = tostring(value or '')
@@ -177,7 +185,7 @@ local function evidence(task)
   for _, url in ipairs(task:get_urls({'http', 'https'}) or {}) do
     if #state.urls >= settings.max_urls then truncated = true; break end
     table.insert(state.urls, {
-      url = field(url:to_http(), 768),
+      url = field(url:get_text(), 768),
       host = field(url:get_host(), 255),
       visible = field(url:get_visible(), 256),
     })
@@ -200,8 +208,8 @@ local function evidence(task)
 end
 
 local function parse_reply(body)
-  local parser = ucl.untrusted_parser()
-  if not parser:parse_string(body) then return nil, 'invalid_json' end
+  local parser = make_parser()
+  if not parser:parse_string(tostring(body)) then return nil, 'invalid_json' end
   local reply = parser:get_object()
   if type(reply) ~= 'table' or reply.model ~= settings.model then
     return nil, 'model_mismatch'
@@ -371,7 +379,6 @@ rspamd_config:register_symbol({
   name = 'JEV_LOG',
   type = 'idempotent',
   flags = 'nostat',
-  priority = 10,
   callback = function(task)
     local record = task:cache_get('jev_eval')
     if not record then return end
@@ -384,4 +391,3 @@ rspamd_config:register_symbol({
     logger.infox(task, 'JEV_EVAL %s', ucl.to_format(record, 'json-compact'))
   end,
 })
-rspamd_config:register_dependency('JEV_LOG', 'JEV_CHECK')
