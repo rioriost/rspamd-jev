@@ -22,7 +22,8 @@ from tools.summarize import read_records  # noqa: E402
 
 
 def wait_for_daemon(process, port):
-    for _ in range(100):
+    deadline = time.monotonic() + 90
+    while time.monotonic() < deadline:
         if process.poll() is not None:
             raise RuntimeError("Rspamd exited during startup")
         try:
@@ -101,8 +102,10 @@ jev {{
                     "-u", getpass.getuser(), "-g", grp.getgrgid(os.getgid()).gr_name,
                 ], stdout=daemon_log, stderr=subprocess.STDOUT)
                 wait_for_daemon(process, port)
-                for index, outcome in enumerate(("ham", "spam", "phishing", "uncertain", "malformed", "429", "529")):
-                    mock.outcome = outcome
+                outcomes = ("ham", "spam", "phishing", "uncertain", "malformed", "429", "500", "529", "timeout")
+                for index, outcome in enumerate(outcomes):
+                    mock.outcome = "ham" if outcome == "timeout" else outcome
+                    mock.delay = 0.8 if outcome == "timeout" else 0
                     message = (
                         f"From: sender@example.test\r\nTo: recipient@example.test\r\n"
                         f"Subject: Synthetic Jev smoke {index}\r\n"
@@ -131,11 +134,11 @@ jev {{
                 process.terminate()
                 process.wait(timeout=10)
             records = list(read_records(io_lines(log_path)))
-            if len(records) != 7 or sum(record["status"] == "ok" for record in records) != 4:
-                raise AssertionError(f"expected 7 paired records, got {records}")
+            if len(records) != len(outcomes) or sum(record["status"] == "ok" for record in records) != 4:
+                raise AssertionError(f"expected {len(outcomes)} paired records, got {records}")
             if any(record["baseline"]["verdict"] != "ham" for record in records):
                 raise AssertionError("GPT postfilter dependency did not finish before Jev")
-            print("Native Rspamd smoke passed: 7 scans, unchanged score/action, paired logs.")
+            print(f"Native Rspamd smoke passed: {len(outcomes)} scans, unchanged score/action, paired logs.")
         except BaseException:
             if log_path.exists():
                 print(log_path.read_text(), file=sys.stderr)
