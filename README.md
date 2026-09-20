@@ -269,7 +269,8 @@ Native tests install into a temporary custom configuration directory using the s
 
 ## Licensing and references
 
-No distribution license has been selected yet. A public repository is not itself a license grant. A license must be chosen before recommending third-party reuse or redistribution.
+This project is licensed under the [MIT License](LICENSE).
+Copyright (c) 2026 Rio Fujita.
 
 - [TypeSafe API](https://docs.typesafe.ai/api), [models and limits](https://docs.typesafe.ai/models), [known model limitations](https://docs.typesafe.ai/model-jaggedness/jev-1.13)
 - [Rspamd GPT module](https://docs.rspamd.com/modules/gpt/), [Lua HTTP API](https://docs.rspamd.com/lua/rspamd_http/)
