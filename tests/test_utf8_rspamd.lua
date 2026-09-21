@@ -2,6 +2,9 @@
 local util = require 'rspamd_util'
 local ucl = require 'ucl'
 local http = require 'rspamd_http'
+local logger = require 'rspamd_logger'
+local native_config, infox = rspamd_config, logger.infox
+logger.infox = function(_, format, ...) infox(native_config, format, ...) end
 local registered, captured
 http.request = function(params)
   captured = params
