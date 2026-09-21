@@ -238,7 +238,7 @@ Quality metrics use the latest successful result per digest; latency/cost includ
 
 ### UTF-8 repair and HTTP errors
 
-Rspamd-extracted text can contain invalid UTF-8, including visible URL text cut in the middle of a multibyte character. Sending such bytes as JSON can cause HTTP 400. The plugin now repairs invalid sequences using Rspamd's UTF-8 converter **before** enforcing field byte budgets, then checks the serialized request again. It does not fetch URLs or change valid text. A failed conversion/validation emits `JEV_ERROR` with `reason = "invalid_utf8"` and sends no request; one malformed message does not open the worker-wide circuit.
+Rspamd-extracted text can contain invalid UTF-8, including visible URL text cut in the middle of a multibyte character. Sending such bytes as JSON can cause HTTP 400. The plugin now repairs invalid sequences using Rspamd's UTF-8 converter **before** enforcing field byte budgets, then checks the serialized request again. Older Rspamd versions without that converter use the native validator with a linear byte-replacement fallback; both preserve valid codepoints. It does not fetch URLs or change valid text. A failed conversion/validation emits `JEV_ERROR` with `reason = "invalid_utf8"` and sends no request; one malformed message does not open the worker-wide circuit.
 
 New records carry `evidence_version = "email-evidence-v2"` and `utf8_repaired_fields`. Older records remain readable on their own. Use `--evidence-version email-evidence-v2` after upgrading to exclude older extraction behavior; other experiment settings must still match, and synthetic verification messages must still be excluded from quality reports.
 

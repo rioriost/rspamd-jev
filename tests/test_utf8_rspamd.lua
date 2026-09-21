@@ -21,10 +21,15 @@ rspamd_config = {
     return symbol.name
   end,
 }
-for _, broken in ipairs({
+local cases = {
   'link\255', 'link\227\129', 'link\192\175', 'link\237\160\128',
   'link\244\144\128\128', string.rep('x', 255) .. '\255',
-}) do
+  '\227\129\130\128after', '\240\159\152\128\128after', 'valid\0text\255',
+}
+local converter = util.to_utf8
+for _, use_native in ipairs({true, false}) do
+  util.to_utf8 = use_native and converter or nil
+  for _, broken in ipairs(cases) do
   assert(not util.is_valid_utf8(broken), 'fixture must be malformed')
   registered, captured = {}, nil
   dofile('rspamd/jev.lua')
@@ -52,7 +57,15 @@ for _, broken in ipairs({
   assert(parser:parse_string(captured.body))
   local visible = parser:get_object().state.urls[1].visible
   assert(util.is_valid_utf8(visible) and #visible <= 256)
+  if broken:sub(1, 3) == '\227\129\130' then
+    assert(visible:sub(1, 3) == '\227\129\130', 'valid Japanese prefix was lost')
+  end
+  if broken:sub(1, 4) == '\240\159\152\128' then
+    assert(visible:sub(1, 4) == '\240\159\152\128', 'valid four-byte prefix was lost')
+  end
   assert(cache.jev_eval.utf8_repaired_fields == 1)
   assert(cache.jev_eval.evidence_version == 'email-evidence-v2')
+  end
 end
-print('Native UTF-8 regression passed: 6 malformed URL fields repaired within byte limits.')
+util.to_utf8 = converter
+print('Native UTF-8 regression passed: 9 malformed URL fields, converter and fallback, within byte limits.')

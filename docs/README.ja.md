@@ -153,6 +153,7 @@ python3 tools/summarize.py /path/to/rspamd.log --labels /private/path/labels.csv
 
 Rspamdが抽出したURL表示文字列などは、マルチバイト文字の途中で切れて不正なUTF-8になることがあります。
 そのままJSON送信するとHTTP 400の原因になるため、各フィールドをRspamdのUTF-8変換機能で修復してからバイト上限を適用し、送信JSONも再検査します。
+変換機能がない旧Rspamdでは、標準のUTF-8検査と線形走査のバイト置換を使い、有効なコードポイントは維持します。
 正常な文字列は変更しません。変換・最終検査に失敗した場合は`JEV_ERROR` / `reason: invalid_utf8`を記録し、外部送信しません。このローカル入力エラーではワーカー全体のcooldownを開始しません。
 
 新ログの`evidence_version: email-evidence-v2`で入力処理を識別し、`utf8_repaired_fields`に修復したフィールド数を記録します。

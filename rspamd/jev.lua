@@ -155,13 +155,31 @@ local function clip(value, limit)
   return text:sub(1, boundary - 1), true
 end
 
+local function repair_utf8(text)
+  if util.to_utf8 then return util.to_utf8(text, 'UTF-8') end
+  -- Older Rspamd has a validator but no converter. Preserve valid codepoints
+  -- and replace only invalid bytes, scanning each non-ASCII run once.
+  local replacement = '\239\191\189'
+  return (text:gsub('[\128-\255][\128-\191]*', function(sequence)
+    local lead = sequence:byte(1)
+    local width = lead >= 194 and lead <= 223 and 2
+        or lead >= 224 and lead <= 239 and 3
+        or lead >= 240 and lead <= 244 and 4 or 1
+    local prefix = sequence:sub(1, width)
+    if #prefix == width and util.is_valid_utf8(prefix) then
+      return prefix .. replacement:rep(#sequence - width)
+    end
+    return replacement:rep(#sequence)
+  end))
+end
+
 local function evidence(task)
   local truncated = false
   local repaired_fields, conversion_failed = 0, false
   local function field(value, limit)
     local text = tostring(value or '')
     if not util.is_valid_utf8(text) then
-      local converted = util.to_utf8(text, 'UTF-8')
+      local converted = repair_utf8(text)
       if not converted or not util.is_valid_utf8(converted) then
         -- Abort the entire request below; never send this placeholder as evidence.
         conversion_failed = true
