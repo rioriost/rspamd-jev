@@ -1,6 +1,7 @@
 -- Rspamd/UCL boundary doubles; run real daemon smoke tests before deployment.
 local registered, records, requests, options, logs, clock, gpt_config
 local reply, parse_ok, schedule_ok, request_hook
+local utf8_replacements
 local tokens = {}
 local serial = 0
 local function encode(object)
@@ -24,7 +25,14 @@ package.preload.rspamd_logger = function()
   return {infox = log, warnx = log, errx = log}
 end
 package.preload.rspamd_util = function()
-  return {get_time = function() return clock end}
+  return {
+    get_time = function() return clock end,
+    is_valid_utf8 = function(value) return utf8_replacements[tostring(value)] == nil end,
+    to_utf8 = function(value, charset)
+      assert(charset == 'UTF-8')
+      return utf8_replacements[tostring(value)]
+    end,
+  }
 end
 package.preload.lua_util = function()
   return {disable_module = function() end}
@@ -60,6 +68,7 @@ end
 local function setup(overrides)
   registered, records, requests, logs, clock = {}, {}, {}, {}, 100
   reply, parse_ok, schedule_ok, request_hook = valid_reply(), true, true, nil
+  utf8_replacements = {}
   options = {enabled = true, sample_rate = 1}
   gpt_config = {type = 'ollama', model = 'baseline-model'}
   for key, value in pairs(overrides or {}) do options[key] = value end
@@ -265,6 +274,92 @@ test('UTF-8 truncation and attachment metadata do not expose attachment contents
   assert(#state.urls == 1 and state.urls[1].visible == 'View invoice')
   assert(state.attachments[1].content_type == 'application/pdf')
   assert(state.verified_auth_symbols[1] == 'R_DKIM_ALLOW')
+end)
+test('repairs malformed evidence before UTF-8-safe byte limits', function()
+  setup({max_body_bytes = 5})
+  local t = task()
+  local broken = 'x\227\129'
+  local repaired = 'x\239\191\189'
+  utf8_replacements[broken] = repaired
+  t.headers.Subject, t.headers.From, t.headers['Reply-To'] = broken, broken, broken
+  t.text = broken
+  t.urls = {{
+    get_text = function() return broken end,
+    get_host = function() return broken end,
+    get_visible = function() return broken end,
+  }}
+  t.parts = {{
+    is_attachment = function() return true end,
+    get_filename = function() return broken end,
+    get_type = function() return 'application', 'pdf' end,
+  }}
+  local r = run(t)
+  local state = tokens[requests[1].body].state
+  assert(state.subject == repaired and state.from == repaired and state.reply_to == repaired)
+  assert(state.text_parts[1].text == repaired and #state.text_parts[1].text <= 5)
+  assert(state.urls[1].visible == repaired and state.attachments[1].filename == repaired)
+  assert(r.utf8_repaired_fields == 8 and r.evidence_version == 'email-evidence-v2')
+  finish()
+  assert(r.status == 'ok')
+end)
+test('conversion failure is an explicit local error, never an external request', function()
+  setup()
+  local t = task()
+  t.text = 'bad\255'
+  utf8_replacements[t.text] = false
+  local r = run(t)
+  assert(r.status == 'error' and r.reason == 'invalid_utf8' and #requests == 0)
+  assert(t.inserted[1][1] == 'JEV_ERROR')
+  assert(run(task()).status == 'pending', 'bad evidence must not open the worker circuit')
+end)
+test('repaired codepoints cannot exceed the body byte budget', function()
+  setup({max_body_bytes = 3})
+  local t = task()
+  t.text = 'a\255'
+  utf8_replacements[t.text] = 'a\239\191\189'
+  local r = run(t)
+  assert(tokens[requests[1].body].state.text_parts[1].text == 'a')
+  assert(r.truncated and r.utf8_repaired_fields == 1)
+end)
+test('final serialized UTF-8 validation prevents malformed requests', function()
+  setup()
+  local ucl = require 'ucl'
+  local original = ucl.to_format
+  utf8_replacements['bad\255json'] = false
+  ucl.to_format = function() return 'bad\255json' end
+  local t = task()
+  local r = run(t)
+  ucl.to_format = original
+  assert(r.status == 'error' and r.reason == 'invalid_utf8' and #requests == 0)
+  assert(t.inserted[1][1] == 'JEV_ERROR')
+end)
+test('API error classes are allowlisted and never include upstream detail', function()
+  for _, case in ipairs({
+    {400, 'body_parse_error', 'There was an error parsing the body'},
+    {400, 'bad_request', 'private mail content or credentials'},
+    {401, 'unauthorized'}, {403, 'forbidden'}, {413, 'request_too_large'},
+    {422, 'validation_error'}, {429, 'rate_limited'}, {500, 'server_error'},
+    {529, 'overloaded'}, {404, 'http_error'},
+  }) do
+    setup()
+    reply = {detail = case[3] or 'private mail content or credentials'}
+    local t = task()
+    local r = run(t)
+    finish(nil, case[1])
+    log(t)
+    assert(r.reason == 'http_status' and r.api_error == case[2])
+    for _, entry in ipairs(logs) do
+      for _, value in ipairs(entry) do
+        assert(not tostring(value):find('private mail content'))
+      end
+    end
+    assert(run(task()).reason == 'circuit_open')
+  end
+  setup()
+  parse_ok = false
+  local r = run(task())
+  finish(nil, 400)
+  assert(r.api_error == 'bad_request')
 end)
 test('malformed and invalid API outputs are errors, never classifications', function()
   for _, mutate in ipairs({

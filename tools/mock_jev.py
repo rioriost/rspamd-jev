@@ -99,7 +99,9 @@ class Handler(BaseHTTPRequestHandler):
             return
         time.sleep(self.server.delay)
         outcome = self.server.outcome
-        if outcome in ("429", "500", "529"):
+        if outcome == "400":
+            self.send_body(400, b'{"detail":"There was an error parsing the body"}')
+        elif outcome in ("429", "500", "529"):
             self.send_body(int(outcome), b'{"error":"simulated"}')
         elif outcome == "malformed":
             self.send_body(200, b'{"answers":')
@@ -118,7 +120,7 @@ def create_server(port=18080, outcome="ham", delay=0.0):
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--port", type=int, default=18080)
-    parser.add_argument("--outcome", choices=(*CATEGORIES, "uncertain", "429", "500", "529", "malformed"),
+    parser.add_argument("--outcome", choices=(*CATEGORIES, "uncertain", "400", "429", "500", "529", "malformed"),
                         default="ham")
     parser.add_argument("--delay", type=float, default=0.0)
     args = parser.parse_args()
