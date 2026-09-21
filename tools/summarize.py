@@ -38,6 +38,18 @@ def read_records(stream):
                 raise ValueError("invalid status")
             if "require_gpt" in record and not isinstance(record["require_gpt"], bool):
                 raise ValueError("invalid require_gpt")
+            if "evidence_version" in record and (
+                    not isinstance(record["evidence_version"], str) or not record["evidence_version"]):
+                raise ValueError("invalid evidence_version")
+            repaired = record.get("utf8_repaired_fields", 0)
+            if not number(repaired) or repaired < 0 or repaired % 1:
+                raise ValueError("invalid utf8_repaired_fields")
+            if "api_error" in record and record["api_error"] not in {
+                "body_parse_error", "bad_request", "unauthorized", "forbidden",
+                "request_too_large", "validation_error", "rate_limited",
+                "overloaded", "server_error", "http_error",
+            }:
+                raise ValueError("invalid api_error")
             if not number(record.get("timestamp")):
                 raise ValueError("invalid timestamp")
             baseline = record.get("baseline")
@@ -117,21 +129,23 @@ def metrics(pairs):
     }
 
 
-def summarize(records, mode="live", labels=None, price_per_million=0.042):
+def summarize(records, mode="live", labels=None, price_per_million=0.042, evidence_version=None):
     labels = labels or {}
-    selected = [record for record in records if record["mode"] == mode]
+    mode_records = [record for record in records if record["mode"] == mode]
+    selected = [record for record in mode_records
+                if evidence_version is None or record.get("evidence_version") == evidence_version]
     configs = {
         json.dumps({
             key: record.get(key) for key in (
                 "model", "prompt_version", "sample_rate", "probability_threshold",
-                "confidence_threshold", "require_gpt"
+                "confidence_threshold", "require_gpt", "evidence_version"
             )
         } | {"baseline": {key: record["baseline"].get(key) for key in ("provider", "configured_model")}},
                    sort_keys=True)
         for record in selected
     }
     if len(configs) > 1:
-        raise ValueError("mixed model/prompt/threshold/sampling/selection/baseline settings; split the input logs")
+        raise ValueError("mixed model/prompt/threshold/sampling/selection/baseline/evidence settings; split the input logs")
     statuses = Counter(record["status"] for record in selected)
     reasons = Counter(record.get("reason", "unspecified") for record in selected if record["status"] != "ok")
     successes = [record for record in selected if record["status"] == "ok"]
@@ -164,12 +178,23 @@ def summarize(records, mode="live", labels=None, price_per_million=0.042):
                    else "Agreement is not accuracy. Labels must be independent human ground truth.",
         "config": json.loads(next(iter(configs))) if configs else None,
         "scans": len(selected),
-        "excluded_other_mode_scans": len(records) - len(selected),
+        "excluded_other_mode_scans": len(records) - len(mode_records),
+        "excluded_other_evidence_scans": len(mode_records) - len(selected),
         "statuses": dict(statuses),
         "skip_error_reasons": dict(reasons),
+        "http_statuses": dict(Counter(str(record["http_status"]) for record in selected
+                                     if record.get("requested") and "http_status" in record)),
+        "api_error_classes": dict(Counter(record["api_error"] for record in selected
+                                         if "api_error" in record)),
+        "utf8_repaired_scans": sum(record.get("utf8_repaired_fields", 0) > 0 for record in selected),
+        "utf8_repaired_fields": sum(record.get("utf8_repaired_fields", 0) for record in selected),
         "successful_unique_messages": len(unique),
         "repeated_successful_scans": len(successes) - len(unique),
         "jev_decisions": dict(Counter(record["jev"]["decision"] for record in unique)),
+        "jev_abstention_rate": (
+            sum(record["jev"]["decision"] == "uncertain" for record in unique) / len(unique)
+            if unique else None
+        ),
         "baseline_verdicts": dict(Counter(record["baseline"]["verdict"] for record in unique)),
         "comparable_unique_messages": len(comparable),
         "agreement": sum(record["baseline"]["verdict"] == binary(record["jev"]["decision"])
@@ -202,6 +227,7 @@ def main():
     parser.add_argument("log", help="Rspamd text log or JSONL; '-' for stdin")
     parser.add_argument("--mode", choices=("live", "mock"), default="live")
     parser.add_argument("--labels", help="CSV: message_digest,label (ham/spam/phishing)")
+    parser.add_argument("--evidence-version", help="Select an evidence version, e.g. email-evidence-v2")
     parser.add_argument("--price-per-million", type=float, default=0.042)
     args = parser.parse_args()
     if not number(args.price_per_million) or args.price_per_million < 0:
@@ -216,7 +242,7 @@ def main():
         if args.labels:
             with open(args.labels, encoding="utf-8", newline="") as stream:
                 labels = read_labels(stream)
-        report = summarize(records, args.mode, labels, args.price_per_million)
+        report = summarize(records, args.mode, labels, args.price_per_million, args.evidence_version)
         print(json.dumps(report, indent=2, ensure_ascii=False, allow_nan=False))
     except (OSError, ValueError) as exc:
         parser.exit(1, f"error: {exc}\n")

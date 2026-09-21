@@ -115,7 +115,7 @@ printf 'From: sender@example.test\nTo: recipient@example.test\nSubject: Syntheti
 
 Expect `JEV_PHISHING` with score 0 and a `JEV_EVAL` log record containing `"mode":"mock"`. Compare the delivery action/score with the plugin disabled. If existing settings skip this scan, use a dedicated test instance (`make smoke`) instead of weakening production policies. Your MTA/worker must supply SMTP recipients for **live** evaluation; the simple mock scan above does not exercise that gate.
 
-The mock returns the selected outcome regardless of content. It also supports `ham`, `spam`, `uncertain`, `429`, `500`, `529`, and `malformed`; `--delay 3` exercises timeouts. It listens only on loopback and rejects real API keys. Its outputs are **not accuracy measurements**.
+The mock returns the selected outcome regardless of content. It also supports `ham`, `spam`, `uncertain`, `400`, `429`, `500`, `529`, and `malformed`; `--delay 3` exercises timeouts. It listens only on loopback and rejects real API keys. Its outputs are **not accuracy measurements**.
 
 Set `enabled = false` and reload when finished, then stop the mock with Ctrl-C. While waiting for API access, leave the plugin disabled.
 
@@ -212,6 +212,7 @@ The plugin's JSON record excludes bodies, subjects, addresses, URLs, keys, and r
 ```sh
 python3 tools/summarize.py /path/to/rspamd.log --mode mock
 python3 tools/summarize.py /path/to/rspamd.log --mode live
+python3 tools/summarize.py /path/to/rspamd.log --mode live --evidence-version email-evidence-v2
 journalctl -u rspamd -o cat | python3 tools/summarize.py - --mode live
 python3 tools/summarize.py /path/to/rspamd.log --labels /private/path/labels.csv
 ```
@@ -221,6 +222,9 @@ Labels must be independently human-verified, not copied from another classifier.
 | Report | Interpretation |
 |---|---|
 | `statuses`, `skip_error_reasons` | Success, failure, and exclusion counts |
+| `http_statuses`, `api_error_classes` | Response-code counts and allowlisted error categories; never raw upstream messages |
+| `utf8_repaired_scans`, `utf8_repaired_fields` | Scans and extracted fields whose invalid UTF-8 was repaired before sending |
+| `jev_abstention_rate` | Fraction of successful unique messages classified as uncertain; not a false-positive rate |
 | `agreement`, `baseline_vs_jev` | Jev vs optional GPT predictions; agreement is **not** accuracy |
 | `http_latency_ms` | Jev HTTP p50/p95/p99, not GPT or total mail-scan time |
 | `estimated_success_cost_usd` | Successful-response input-token estimate, not a verified bill; adjust `--price-per-million` |
@@ -230,7 +234,15 @@ Labels must be independently human-verified, not copied from another classifier.
 
 Binary metrics combine spam and phishing. Uncertain/unobserved/conflicting predictions are excluded from the corresponding paired metrics, with coverage reported separately. Pipeline actions map `no action` to ham and `reject` / `add header` / `rewrite subject` / `quarantine` / `discard` to spam; deferrals such as `greylist` and `soft reject` are unresolved. Check that this interpretation matches your site's policy.
 
-Quality metrics use the latest successful result per digest; latency/cost include all requests with relevant observations. Mixed models, prompts, thresholds, sampling/selection policies, or GPT configurations are rejected: split logs by experiment. No labels means no claim of measured accuracy. Prioritize ham false positives, missed-spam reduction, and abstention coverage, not aggregate accuracy alone.
+Quality metrics use the latest successful result per digest; latency/cost include all requests with relevant observations. Mixed models, prompts, evidence versions, thresholds, sampling/selection policies, or GPT configurations are rejected: split logs by experiment. No labels means no claim of measured accuracy. Prioritize ham false positives, missed-spam reduction, and abstention coverage, not aggregate accuracy alone.
+
+### UTF-8 repair and HTTP errors
+
+Rspamd-extracted text can contain invalid UTF-8, including visible URL text cut in the middle of a multibyte character. Sending such bytes as JSON can cause HTTP 400. The plugin now repairs invalid sequences using Rspamd's UTF-8 converter **before** enforcing field byte budgets, then checks the serialized request again. Older Rspamd versions without that converter use the native validator with a linear byte-replacement fallback; both preserve valid codepoints. It does not fetch URLs or change valid text. A failed conversion/validation emits `JEV_ERROR` with `reason = "invalid_utf8"` and sends no request; one malformed message does not open the worker-wide circuit.
+
+New records carry `evidence_version = "email-evidence-v2"` and `utf8_repaired_fields`. Older records remain readable on their own. Use `--evidence-version email-evidence-v2` after upgrading to exclude older extraction behavior; other experiment settings must still match, and synthetic verification messages must still be excluded from quality reports.
+
+HTTP failures retain `reason = "http_status"` and add `api_error`: `body_parse_error` for the API's recognized body-parsing rejection, otherwise a fixed category such as `bad_request`, `validation_error`, `rate_limited`, or `server_error`. Unknown messages are never copied into logs. These categories aid diagnosis but do not establish the cause of every HTTP 400. Requests are not retried, thresholds remain unchanged, and HTTP failures still activate the configured cooldown.
 
 ### Migration from the initial comparison-only defaults
 

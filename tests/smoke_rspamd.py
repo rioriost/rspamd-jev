@@ -44,6 +44,13 @@ def main():
     if not shutil.which("rspamd") or not shutil.which("rspamadm"):
         raise SystemExit("Native smoke test requires rspamd and rspamadm (run on Linux or CI).")
     root = Path(__file__).resolve().parents[1]
+    utf8_test = subprocess.run(
+        ["rspamadm", "lua", "-b", "-e", "dofile('tests/test_utf8_rspamd.lua')"],
+        cwd=root, input="", text=True, check=True, timeout=10, capture_output=True,
+    )
+    if "Native UTF-8 regression passed:" not in utf8_test.stdout:
+        raise AssertionError(f"Native UTF-8 regression failed: {utf8_test.stdout}\n{utf8_test.stderr}")
+    print(utf8_test.stdout.strip())
     with socket.socket() as listener:
         listener.bind(("127.0.0.1", 0))
         port = listener.getsockname()[1]
@@ -132,12 +139,18 @@ jev {{
                     "-u", getpass.getuser(), "-g", grp.getgrgid(os.getgid()).gr_name,
                 ], stdout=daemon_log, stderr=subprocess.STDOUT)
                 wait_for_daemon(process, port)
-                outcomes = ("ham", "spam", "phishing", "uncertain", "malformed", "429", "500", "529", "timeout")
+                outcomes = ("ham", "spam", "phishing", "uncertain", "malformed", "400", "429", "500", "529", "timeout")
                 if args.scenario == "disabled":
                     outcomes = ("ham",)
                 for index, outcome in enumerate(outcomes):
                     mock.outcome = "ham" if outcome == "timeout" else outcome
                     mock.delay = 0.8 if outcome == "timeout" else 0
+                    anchors = "".join(
+                        f'<a href="https://example.test/utf8/{prefix}">{"x" * prefix}'
+                        f'{"&#12354;" * 100}</a>\r\n'
+                        for prefix in range(3)
+                    )
+                    anchors += '<a href="https://example.test/broken">synthetic-broken-utf8</a>\r\n'
                     message = (
                         f"From: sender@example.test\r\nTo: recipient@example.test\r\n"
                         f"Subject: Synthetic Jev smoke {index}\r\n"
@@ -145,7 +158,8 @@ jev {{
                         f"MIME-Version: 1.0\r\nContent-Type: text/html; charset=utf-8\r\n\r\n"
                         f"<p>Synthetic fixture {index}, no real email.</p>"
                         '<a href="https://example.test/invoice">View invoice</a>\r\n'
-                    ).encode()
+                        + anchors
+                    ).encode().replace(b"synthetic-broken-utf8", b"synthetic\xe3\x81")
                     request = urllib.request.Request(
                         f"http://127.0.0.1:{port}/checkv2", data=message,
                         headers={"Content-Type": "text/plain", "Rcpt": "recipient@example.test"},
@@ -180,8 +194,14 @@ jev {{
                 raise AssertionError("final optional GPT observations are incorrect")
             if any(record["require_gpt"] != (args.scenario == "gpt") for record in records):
                 raise AssertionError("incorrect GPT selection mode in logs")
+            if any(record["evidence_version"] != "email-evidence-v2" for record in records):
+                raise AssertionError("missing evidence version")
+            bad_request = next(record for record in records if record.get("http_status") == 400)
+            if bad_request.get("api_error") != "body_parse_error":
+                raise AssertionError("missing redacted HTTP 400 diagnosis")
             print(f"Native Rspamd smoke passed: {args.scenario}, {len(outcomes)} scans, "
-                  "unchanged score/action, paired logs.")
+                  "unchanged score/action, paired logs, "
+                  f"{sum(r.get('utf8_repaired_fields', 0) for r in records)} UTF-8 field repairs.")
         except BaseException:
             if log_path.exists():
                 print(log_path.read_text(), file=sys.stderr)

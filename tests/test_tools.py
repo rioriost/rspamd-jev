@@ -82,7 +82,7 @@ class MockTests(unittest.TestCase):
             self.assertLess(json.load(response)["answers"]["category"]["confidence"], 0.9)
 
     def test_http_errors(self):
-        for code in (429, 500, 529):
+        for code in (400, 429, 500, 529):
             with self.subTest(code=code):
                 self.server.outcome = str(code)
                 with self.assertRaises(urllib.error.HTTPError) as error:
@@ -237,6 +237,42 @@ class ReportTests(unittest.TestCase):
         self.assertEqual(result["scans"], 0)
         self.assertIsNone(result["agreement"])
         self.assertIsNone(result["http_latency_ms"]["p99"])
+
+    def test_evidence_versions_are_separate_from_legacy_observations(self):
+        old, new = record(), record("b")
+        new.update(evidence_version="email-evidence-v2", utf8_repaired_fields=2)
+        with self.assertRaisesRegex(ValueError, "evidence"):
+            summarize.summarize([old, new])
+        result = summarize.summarize([old, new], evidence_version="email-evidence-v2")
+        self.assertEqual(result["scans"], 1)
+        self.assertEqual(result["excluded_other_evidence_scans"], 1)
+        self.assertEqual(result["excluded_other_mode_scans"], 0)
+        self.assertEqual(result["utf8_repaired_scans"], 1)
+        self.assertEqual(result["utf8_repaired_fields"], 2)
+        self.assertEqual(summarize.summarize([old])["scans"], 1)
+
+    def test_reports_http_errors_repairs_and_abstentions(self):
+        success, error = record(decision="uncertain"), record("b")
+        success.update(http_status=200, utf8_repaired_fields=3)
+        error.update(status="error", reason="http_status", http_status=400,
+                     api_error="body_parse_error")
+        del error["jev"]
+        result = summarize.summarize([success, error])
+        self.assertEqual(result["http_statuses"], {"200": 1, "400": 1})
+        self.assertEqual(result["api_error_classes"], {"body_parse_error": 1})
+        self.assertEqual(result["utf8_repaired_scans"], 1)
+        self.assertEqual(result["jev_abstention_rate"], 1)
+
+    def test_invalid_diagnostic_metadata_is_rejected(self):
+        for field, value in (
+            ("evidence_version", ""), ("evidence_version", False),
+            ("utf8_repaired_fields", -1), ("utf8_repaired_fields", 1.5),
+            ("utf8_repaired_fields", True), ("api_error", "arbitrary upstream text"),
+        ):
+            item = record()
+            item[field] = value
+            with self.subTest(field=field, value=value), self.assertRaises(ValueError):
+                list(summarize.read_records(io.StringIO(json.dumps(item))))
 
     def test_mock_cost_is_zero(self):
         result = summarize.summarize([record(mode="mock")], mode="mock")

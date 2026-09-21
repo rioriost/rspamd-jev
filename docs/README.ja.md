@@ -100,7 +100,7 @@ printf 'From: sender@example.test\nTo: recipient@example.test\nSubject: Syntheti
 
 スコア0の`JEV_PHISHING`、`"mode":"mock"`の`JEV_EVAL`ログ、無効時と同じ最終スコア/アクションを確認します。既存の設定でスキャン自体が省略される場合は、本番設定を緩めず`make smoke`の隔離環境で確認してください。
 
-モックはメールを分類せず、指定した固定結果を返します。`--outcome`には`ham`、`spam`、`phishing`、`uncertain`、`429`、`500`、`529`、`malformed`を指定できます。`--delay 3`でタイムアウトを再現できます。実APIキーは渡しません。
+モックはメールを分類せず、指定した固定結果を返します。`--outcome`には`ham`、`spam`、`phishing`、`uncertain`、`400`、`429`、`500`、`529`、`malformed`を指定できます。`--delay 3`でタイムアウトを再現できます。実APIキーは渡しません。
 
 確認後は`enabled = false`で再読込し、モックをCtrl-Cで停止します。APIキー待ちの期間はこの状態にしてください。
 
@@ -141,12 +141,29 @@ JevはシャドーモードでもAPIの応答を待つため、メール単位�
 ```sh
 python3 tools/summarize.py /path/to/rspamd.log --mode mock
 python3 tools/summarize.py /path/to/rspamd.log --mode live
+python3 tools/summarize.py /path/to/rspamd.log --mode live --evidence-version email-evidence-v2
 python3 tools/summarize.py /path/to/rspamd.log --labels /private/path/labels.csv
 ```
 
 人手の正解CSVは`message_digest,label`、ラベルは`ham` / `spam` / `phishing`です。`agreement`は任意のGPTとの一致率であり、正解率ではありません。GPTなしでも`pipeline_paired_labeled_rspamd`と`pipeline_paired_labeled_jev`で現行Rspamd対Jevを比較できます。不確実・未観測は該当の精度計算から除外し、coverageを別に記録します。
 
 ログには本文・件名・アドレス・URL・キーを含めませんが、Rspamd既存ログの別の行やプレフィックスはその限りではありません。digest、ログ、ラベルも保護対象です。設定が異なる実験のログは混ぜず、正常メールの誤検知率・見逃し改善・保留率を優先して評価します。
+
+### UTF-8修復とHTTPエラー診断
+
+Rspamdが抽出したURL表示文字列などは、マルチバイト文字の途中で切れて不正なUTF-8になることがあります。
+そのままJSON送信するとHTTP 400の原因になるため、各フィールドをRspamdのUTF-8変換機能で修復してからバイト上限を適用し、送信JSONも再検査します。
+変換機能がない旧Rspamdでは、標準のUTF-8検査と線形走査のバイト置換を使い、有効なコードポイントは維持します。
+正常な文字列は変更しません。変換・最終検査に失敗した場合は`JEV_ERROR` / `reason: invalid_utf8`を記録し、外部送信しません。このローカル入力エラーではワーカー全体のcooldownを開始しません。
+
+新ログの`evidence_version: email-evidence-v2`で入力処理を識別し、`utf8_repaired_fields`に修復したフィールド数を記録します。
+更新前後を混ぜず、上の`--evidence-version`で新しい処理だけを集計してください。他の設定差分や合成メールの除外も引き続き必要です。
+`utf8_repaired_scans` / `utf8_repaired_fields`は修復状況、`http_statuses` / `api_error_classes`はHTTPエラー、
+`jev_abstention_rate`は成功した重複除外メールの判定保留率です。
+
+HTTPエラーは従来の`reason: http_status`を維持し、`api_error`に固定の分類だけを追加します。
+認識済みの本文解析エラーは`body_parse_error`、それ以外の400は`bad_request`などとし、生のエラー本文をログへ転記しません。
+すべての400の原因が判明するわけではありません。再試行はせず、HTTPエラー時のcooldownと判定閾値は変更しません。
 
 **初期版からの更新時の注意:**
 

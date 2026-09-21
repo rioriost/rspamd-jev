@@ -155,10 +155,41 @@ local function clip(value, limit)
   return text:sub(1, boundary - 1), true
 end
 
+local function repair_utf8(text)
+  if util.to_utf8 then return util.to_utf8(text, 'UTF-8') end
+  -- Older Rspamd has a validator but no converter. Preserve valid codepoints
+  -- and replace only invalid bytes, scanning each non-ASCII run once.
+  local replacement = '\239\191\189'
+  return (text:gsub('[\128-\255][\128-\191]*', function(sequence)
+    local lead = sequence:byte(1)
+    local width = lead >= 194 and lead <= 223 and 2
+        or lead >= 224 and lead <= 239 and 3
+        or lead >= 240 and lead <= 244 and 4 or 1
+    local prefix = sequence:sub(1, width)
+    if #prefix == width and util.is_valid_utf8(prefix) then
+      return prefix .. replacement:rep(#sequence - width)
+    end
+    return replacement:rep(#sequence)
+  end))
+end
+
 local function evidence(task)
   local truncated = false
+  local repaired_fields, conversion_failed = 0, false
   local function field(value, limit)
-    local text, shortened = clip(value, limit)
+    local text = tostring(value or '')
+    if not util.is_valid_utf8(text) then
+      local converted = repair_utf8(text)
+      if not converted or not util.is_valid_utf8(converted) then
+        -- Abort the entire request below; never send this placeholder as evidence.
+        conversion_failed = true
+        return ''
+      end
+      text = tostring(converted)
+      repaired_fields = repaired_fields + 1
+    end
+    local shortened
+    text, shortened = clip(text, limit)
     truncated = truncated or shortened
     return text
   end
@@ -207,7 +238,27 @@ local function evidence(task)
     if task:has_symbol(symbol) then table.insert(state.verified_auth_symbols, symbol) end
   end
   state.truncated = truncated
-  return state
+  if conversion_failed then return nil, repaired_fields end
+  return state, repaired_fields
+end
+
+local function api_error_class(code, body)
+  if code == 400 then
+    local parser = make_parser()
+    if parser:parse_string(tostring(body)) then
+      local error_reply = parser:get_object()
+      if type(error_reply) == 'table'
+          and error_reply.detail == 'There was an error parsing the body' then
+        return 'body_parse_error'
+      end
+    end
+    return 'bad_request'
+  end
+  local classes = {
+    [401] = 'unauthorized', [403] = 'forbidden', [413] = 'request_too_large',
+    [422] = 'validation_error', [429] = 'rate_limited', [529] = 'overloaded',
+  }
+  return classes[code] or (code >= 500 and 'server_error' or 'http_error')
 end
 
 local function parse_reply(body)
@@ -278,6 +329,7 @@ local function check(task)
     mode = settings.mode,
     model = settings.model,
     prompt_version = 'email-choice-v1',
+    evidence_version = 'email-evidence-v2',
     sample_rate = settings.sample_rate,
     require_gpt = settings.require_gpt,
     probability_threshold = settings.probability_threshold,
@@ -311,7 +363,14 @@ local function check(task)
   if now < blocked_until then skip('circuit_open'); return end
   if inflight >= settings.max_inflight then skip('inflight_limit'); return end
   if now < next_request then skip('rate_limit'); return end
-  local state = evidence(task)
+  local state, repaired_fields = evidence(task)
+  record.utf8_repaired_fields = repaired_fields
+  local function invalid_request()
+    record.status, record.reason = 'error', 'invalid_utf8'
+    task:insert_result('JEV_ERROR', 0.0, 'invalid_utf8')
+    logger.warnx(task, 'jev: invalid UTF-8 after evidence conversion; request not sent')
+  end
+  if not state then invalid_request(); return end
   if #state.text_parts == 0 and state.subject == '' and #state.urls == 0 then
     skip('no_text_evidence'); return
   end
@@ -321,21 +380,24 @@ local function check(task)
     questions = {category = question},
   }, 'json-compact')
   record.truncated, record.request_bytes = state.truncated, #body
+  if not util.is_valid_utf8(body) then invalid_request(); return end
   if #body > settings.max_request_bytes then skip('request_too_large'); return end
 
   local started, finished = util.get_time(), false
   inflight, next_request = inflight + 1, now + 1 / settings.requests_per_second
   record.requested = true
-  local function complete(reason, result, code)
+  local function complete(reason, result, code, api_error)
     if finished then return end
     finished, inflight = true, inflight - 1
     record.latency_ms = math.max(0, (util.get_time() - started) * 1000)
     record.http_status = code
+    record.api_error = api_error
     if reason then
       record.status, record.reason = 'error', reason
       blocked_until = util.get_time() + settings.cooldown
       task:insert_result('JEV_ERROR', 0.0, reason)
-      logger.warnx(task, 'jev: evaluation failed (%s, HTTP %s)', reason, code or 0)
+      logger.warnx(task, 'jev: evaluation failed (%s, HTTP %s, %s)',
+          reason, code or 0, api_error or 'no_api_error')
     else
       record.status, record.jev = 'ok', result
       task:insert_result('JEV_' .. result.decision:upper(), 0.0,
@@ -355,7 +417,9 @@ local function check(task)
     no_ssl_verify = false,
     callback = function(err, code, response)
       if err then complete('transport', nil, code); return end
-      if code ~= 200 then complete('http_status', nil, code); return end
+      if code ~= 200 then
+        complete('http_status', nil, code, api_error_class(code, response)); return
+      end
       local result, reason = parse_reply(response)
       complete(reason, result, code)
     end,
